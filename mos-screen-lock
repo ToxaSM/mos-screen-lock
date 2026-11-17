@@ -1,0 +1,396 @@
+#!/usr/bin/python3
+import argparse
+import getpass
+import hashlib
+import hmac
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+CONFIG_DIR = Path("/etc/mos-screen-lock")
+PIN_FILE = CONFIG_DIR / "pin"
+CUSTOM_IMAGE = CONFIG_DIR / "background.png"
+DEFAULT_IMAGE = Path("/usr/share/mos-screen-lock/background.png")
+TITLE = "Блокировка экрана"
+PIN_PATTERN = re.compile(r"[0-9]{6,12}")
+TRAY_HOLD_MS = 700
+
+
+def is_long_press(started, released):
+    return started is not None and (released - started) % (1 << 32) >= TRAY_HOLD_MS
+
+
+def pin_digest(pin, salt):
+    return hashlib.pbkdf2_hmac("sha256", pin.encode("ascii"), salt, 600_000)
+
+
+def configure_pin():
+    if os.geteuid() != 0:
+        raise ValueError("Настройка PIN требует прав администратора.")
+    pin = getpass.getpass("Новый PIN (6–12 цифр): ")
+    if not PIN_PATTERN.fullmatch(pin):
+        raise ValueError("PIN должен содержать от 6 до 12 цифр.")
+    if pin != getpass.getpass("Повторите PIN: "):
+        raise ValueError("Введённые PIN не совпадают.")
+
+    CONFIG_DIR.mkdir(mode=0o755, exist_ok=True)
+    salt = os.urandom(32)
+    fd, temporary_name = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".pin-")
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as stream:
+            stream.write(f"{salt.hex()}:{pin_digest(pin, salt).hex()}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.fchmod(stream.fileno(), 0o644)
+        os.replace(temporary_name, PIN_FILE)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
+    print("PIN установлен.")
+
+
+def read_pin():
+    salt_hex, digest_hex = PIN_FILE.read_text(encoding="ascii").strip().split(":")
+    salt, digest = bytes.fromhex(salt_hex), bytes.fromhex(digest_hex)
+    if len(salt) != 32 or len(digest) != 32:
+        raise ValueError("Неверный формат файла PIN.")
+    return salt, digest
+
+
+def run_desktop(request_lock):
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("GdkX11", "3.0")
+    gi.require_version("GdkPixbuf", "2.0")
+    gi.require_foreign("cairo")
+    from gi.repository import Gdk, GdkPixbuf, GdkX11, Gio, GLib, Gtk
+
+    def notify(message):
+        dialog = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.CLOSE,
+            text=TITLE,
+            secondary_text=message,
+        )
+        dialog.run()
+        dialog.destroy()
+
+    class LockWindow(Gtk.Window):
+        def __init__(self, display, image, salt, digest):
+            super().__init__(type=Gtk.WindowType.POPUP)
+            self.display = display
+            self.seat = display.get_default_seat()
+            self.image = image
+            self.salt = salt
+            self.digest = digest
+            self.pending = False
+            self.grabbed = False
+            self.recovery_source = 0
+            self.pin = ""
+            self.set_decorated(False)
+            self.set_resizable(True)
+            self.connect("delete-event", lambda *_: True)
+            self.connect("key-press-event", self.key_pressed)
+            self.connect("grab-broken-event", self.grab_broken)
+            self.connect("destroy", self.cleanup)
+
+            self.overlay = Gtk.Overlay()
+            canvas = Gtk.DrawingArea()
+            canvas.connect("draw", self.draw_background)
+            self.overlay.add(canvas)
+            self.add(self.overlay)
+
+            self.panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            self.panel.get_style_context().add_class("pin-panel")
+            self.panel.pack_start(Gtk.Label(label="Экран заблокирован"), False, False, 0)
+            self.entry = Gtk.Entry()
+            self.entry.set_visibility(False)
+            self.entry.set_editable(False)
+            self.entry.set_can_focus(False)
+            self.entry.set_placeholder_text("Введите PIN")
+            self.entry.connect("button-press-event", lambda *_: True)
+            self.panel.pack_start(self.entry, False, False, 0)
+            self.keypad_toggle = Gtk.Button(label="Показать клавиатуру")
+            self.keypad_toggle.set_can_focus(False)
+            self.keypad_toggle.connect("clicked", self.toggle_keypad)
+            self.panel.pack_start(self.keypad_toggle, False, False, 0)
+            keypad = Gtk.Grid(column_spacing=8, row_spacing=8, column_homogeneous=True)
+            for index, digit in enumerate("123456789"):
+                key = Gtk.Button(label=digit)
+                key.set_can_focus(False)
+                key.connect("clicked", self.digit_pressed, digit)
+                keypad.attach(key, index % 3, index // 3, 1, 1)
+            zero = Gtk.Button(label="0")
+            zero.set_can_focus(False)
+            zero.connect("clicked", self.digit_pressed, "0")
+            keypad.attach(zero, 0, 3, 2, 1)
+            erase = Gtk.Button(label="⌫")
+            erase.set_can_focus(False)
+            erase.get_accessible().set_name("Удалить последнюю цифру")
+            erase.connect("clicked", self.erase_digit)
+            keypad.attach(erase, 2, 3, 1, 1)
+            self.keypad_revealer = Gtk.Revealer(
+                reveal_child=False, transition_type=Gtk.RevealerTransitionType.NONE
+            )
+            self.keypad_revealer.add(keypad)
+            self.panel.pack_start(self.keypad_revealer, False, False, 0)
+            button = Gtk.Button(label="Разблокировать")
+            button.set_can_focus(False)
+            button.connect("clicked", self.submit)
+            self.panel.pack_start(button, False, False, 0)
+            self.status = Gtk.Label(label=" ")
+            self.status.set_width_chars(35)
+            self.panel.pack_start(self.status, False, False, 0)
+            self.panel.set_halign(Gtk.Align.CENTER)
+            self.panel.set_valign(Gtk.Align.CENTER)
+            self.overlay.add_overlay(self.panel)
+
+            screen = self.get_screen()
+            self.screen_handlers = [
+                screen.connect("monitors-changed", self.layout),
+                screen.connect("size-changed", self.layout),
+            ]
+            self.layout()
+
+        def layout(self, *_):
+            monitors = [
+                self.display.get_monitor(index).get_geometry()
+                for index in range(self.display.get_n_monitors())
+            ]
+            if not monitors:
+                return
+            left = min(m.x for m in monitors)
+            top = min(m.y for m in monitors)
+            right = max(m.x + m.width for m in monitors)
+            bottom = max(m.y + m.height for m in monitors)
+            primary = self.display.get_primary_monitor() or self.display.get_monitor(0)
+            geometry = primary.get_geometry()
+            offset_x = 2 * geometry.x + geometry.width - left - right
+            offset_y = 2 * geometry.y + geometry.height - top - bottom
+            self.panel.set_margin_start(max(0, offset_x))
+            self.panel.set_margin_end(max(0, -offset_x))
+            self.panel.set_margin_top(max(0, offset_y))
+            self.panel.set_margin_bottom(max(0, -offset_y))
+            self.move(left, top)
+            self.resize(right - left, bottom - top)
+            self.overlay.queue_draw()
+
+        def draw_background(self, widget, context):
+            width = widget.get_allocated_width()
+            height = widget.get_allocated_height()
+            image_width = self.image.get_width()
+            image_height = self.image.get_height()
+            scale = max(width / image_width, height / image_height)
+            context.set_source_rgb(0.04, 0.07, 0.13)
+            context.paint()
+            context.translate((width - image_width * scale) / 2,
+                              (height - image_height * scale) / 2)
+            context.scale(scale, scale)
+            Gdk.cairo_set_source_pixbuf(context, self.image, 0, 0)
+            context.paint()
+            return False
+
+        def acquire(self):
+            window = self.get_window()
+            window.raise_()
+            self.display.sync()
+            self.grabbed = self.seat.grab(
+                window, Gdk.SeatCapabilities.ALL, True, None, None, None, None
+            ) == Gdk.GrabStatus.SUCCESS
+            return self.grabbed
+
+        def grab_broken(self, *_):
+            if self.grabbed and not self.recovery_source:
+                self.recovery_source = GLib.timeout_add(100, self.recover_grab)
+            return True
+
+        def recover_grab(self):
+            self.seat.ungrab()
+            if self.acquire():
+                self.recovery_source = 0
+                return GLib.SOURCE_REMOVE
+            return GLib.SOURCE_CONTINUE
+
+        def set_pin_text(self, pin):
+            self.pin = pin
+            self.entry.set_text(pin)
+
+        def toggle_keypad(self, *_):
+            reveal = not self.keypad_revealer.get_reveal_child()
+            self.keypad_revealer.set_reveal_child(reveal)
+            self.keypad_toggle.set_label(
+                "Скрыть клавиатуру" if reveal else "Показать клавиатуру"
+            )
+
+        def digit_pressed(self, _widget, digit):
+            if self.grabbed and not self.pending and len(self.pin) < 12:
+                self.set_pin_text(self.pin + digit)
+
+        def erase_digit(self, *_):
+            if self.grabbed and not self.pending:
+                self.set_pin_text(self.pin[:-1])
+
+        def key_pressed(self, _widget, event):
+            if self.pending:
+                return True
+            if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                self.submit()
+            elif event.keyval == Gdk.KEY_BackSpace:
+                self.erase_digit()
+            elif not event.state & (Gdk.ModifierType.CONTROL_MASK |
+                                    Gdk.ModifierType.MOD1_MASK |
+                                    Gdk.ModifierType.SUPER_MASK):
+                digit = Gdk.keyval_to_unicode(event.keyval)
+                if ord("0") <= digit <= ord("9"):
+                    self.digit_pressed(None, chr(digit))
+            return True
+
+        def submit(self, *_):
+            if self.pending or not self.grabbed:
+                return
+            pin = self.pin
+            self.set_pin_text("")
+            if PIN_PATTERN.fullmatch(pin) and hmac.compare_digest(
+                pin_digest(pin, self.salt), self.digest
+            ):
+                self.destroy()
+                return
+            self.pending = True
+            self.status.set_text("Неверный PIN. Подождите 2 секунды.")
+            GLib.timeout_add(2000, self.reset_attempt)
+
+        def reset_attempt(self):
+            self.pending = False
+            if self.get_visible():
+                self.status.set_text(" ")
+            return GLib.SOURCE_REMOVE
+
+        def cleanup(self, *_):
+            if self.recovery_source:
+                GLib.source_remove(self.recovery_source)
+            if self.grabbed:
+                self.seat.ungrab()
+            for handler in self.screen_handlers:
+                self.get_screen().disconnect(handler)
+
+    class TrayApp(Gtk.Application):
+        def __init__(self):
+            super().__init__(
+                application_id="ru.mos.ScreenLock",
+                flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+            )
+            self.tray = None
+            self.window = None
+            self.ready = False
+            self.press_time = None
+
+        def do_command_line(self, command_line):
+            self.activate()
+            if self.ready and command_line.get_arguments()[1:] == ["lock"]:
+                self.lock()
+            return 0
+
+        def do_activate(self):
+            if self.ready:
+                return
+            self.display = Gdk.Display.get_default()
+            if (os.environ.get("XDG_SESSION_TYPE") == "wayland" or
+                    not isinstance(self.display, GdkX11.X11Display)):
+                notify("Блокировка доступна в графическом сеансе X11.")
+                return
+            css = Gtk.CssProvider()
+            css.load_from_data(b"""
+                .pin-panel {
+                    background: #f5f7fb;
+                    color: #192638;
+                    padding: 22px 26px;
+                    border-radius: 14px;
+                }
+            """)
+            Gtk.StyleContext.add_provider_for_screen(
+                self.display.get_default_screen(), css,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
+            desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").upper().split(":")
+            if "KDE" not in desktop:
+                self.tray = Gtk.StatusIcon.new_from_icon_name("system-lock-screen")
+                self.tray.set_title(TITLE)
+                self.tray.set_tooltip_text("Удерживайте левую кнопку, затем отпустите")
+                self.tray.connect("button-press-event", self.tray_pressed)
+                self.tray.connect("button-release-event", self.tray_released)
+                self.hold()
+            self.ready = True
+
+        def tray_pressed(self, _tray, event):
+            if event.button != 1:
+                return False
+            if event.type == Gdk.EventType.BUTTON_PRESS:
+                self.press_time = event.time
+            return True
+
+        def tray_released(self, _tray, event):
+            if event.button != 1:
+                return False
+            started, self.press_time = self.press_time, None
+            if is_long_press(started, event.time):
+                GLib.idle_add(self.lock)
+            return True
+
+        def lock(self, *_):
+            if self.window is not None:
+                return
+            try:
+                salt, digest = read_pin()
+            except (OSError, ValueError):
+                notify("Задайте PIN командой sudo mos-screen-lock --set-pin.")
+                return
+            path = CUSTOM_IMAGE if CUSTOM_IMAGE.exists() else DEFAULT_IMAGE
+            try:
+                image = GdkPixbuf.Pixbuf.new_from_file(str(path))
+            except GLib.Error:
+                notify(f"Не удалось открыть изображение {path}.")
+                return
+            self.window = LockWindow(self.display, image, salt, digest)
+            self.hold()
+            self.window.connect("destroy", self.clear_window)
+            self.window.show_all()
+            if not self.window.acquire():
+                GLib.timeout_add(120, self.retry_lock)
+
+        def retry_lock(self):
+            if self.window is not None and not self.window.acquire():
+                self.window.destroy()
+                notify("Не удалось захватить клавиатуру и мышь. Повторите попытку.")
+            return GLib.SOURCE_REMOVE
+
+        def clear_window(self, *_):
+            self.window = None
+            self.release()
+
+    arguments = ["mos-screen-lock", "lock"] if request_lock else ["mos-screen-lock"]
+    return TrayApp().run(arguments)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=TITLE)
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--set-pin", action="store_true", help="задать PIN от имени root")
+    actions.add_argument("--lock", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    try:
+        if args.set_pin:
+            configure_pin()
+            return 0
+        return run_desktop(args.lock)
+    except (OSError, ValueError, ImportError) as error:
+        print(error, file=sys.stderr)
+        return 1
+    except (EOFError, KeyboardInterrupt):
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,37 @@
+name: mos-screen-lock
+arch: all
+platform: linux
+version: 1.1.2
+release: "1"
+description: PIN-based full-screen cover for the ROSA Linux X11 desktop
+section: Applications/System
+depends:
+  - python3
+  - python3-gi
+  - python3-gi-cairo
+  - lib64gtk-gir3.0
+contents:
+  - src: ./mos-screen-lock
+    dst: /usr/bin/mos-screen-lock
+    file_info:
+      mode: 0755
+  - src: ./mos-screen-lock.desktop
+    dst: /usr/share/applications/mos-screen-lock.desktop
+    file_info:
+      mode: 0644
+  - src: ./mos-screen-lock.desktop
+    dst: /etc/xdg/autostart/mos-screen-lock.desktop
+    file_info:
+      mode: 0644
+  - src: ./background.png
+    dst: /usr/share/mos-screen-lock/background.png
+    file_info:
+      mode: 0644
+  - src: ./plasma-metadata.desktop
+    dst: /usr/share/plasma/plasmoids/ru.mos.screenlock/metadata.desktop
+    file_info:
+      mode: 0644
+  - src: ./plasma-main.qml
+    dst: /usr/share/plasma/plasmoids/ru.mos.screenlock/contents/ui/main.qml
+    file_info:
+      mode: 0644

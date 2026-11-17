@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MOS Screen Lock
+Name[ru]=Блокировка экрана
+Comment[ru]=Блокировка экрана с PIN-кодом из системного трея
+Exec=/usr/bin/mos-screen-lock
+TryExec=/usr/bin/mos-screen-lock
+Icon=system-lock-screen
+Terminal=false
+Categories=Utility;
