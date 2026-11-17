@@ -8,7 +8,7 @@
 
 Пакет версии **1.1.2** предназначен для МОС Desktop 12 x86_64 с KDE Plasma 5 в сеансе X11. Чтобы проверить тип сеанса, откройте терминал на рабочем столе МОС и выполните `echo "$XDG_SESSION_TYPE"`. Ожидаемый результат — `x11`.
 
-Сохраните файл `mos-screen-lock-1.1.2-1.noarch.rpm` на компьютере с МОС. Откройте терминал в папке с пакетом и выполните:
+Скачайте [`mos-screen-lock-1.1.2-1.noarch.rpm`](https://github.com/ToxaSM/mos-screen-lock/releases/download/v1.1.2/mos-screen-lock-1.1.2-1.noarch.rpm) на компьютер с МОС. Откройте терминал в папке с пакетом и выполните:
 
 ```bash
 sudo dnf install ./mos-screen-lock-1.1.2-1.noarch.rpm
